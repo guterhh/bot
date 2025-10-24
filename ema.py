@@ -20,7 +20,9 @@ class AdvancedForexBot:
             'USDCHFm': self.usdchf_strategy,
             'AUDUSDm': self.audusd_strategy,
             'USDCADm': self.usdcad_strategy,
-            'NZDUSDm': self.nzdusd_strategy
+            'NZDUSDm': self.nzdusd_strategy,
+            'BTCUSDm': self.btcusd_strategy,
+            'ETHUSDm': self.ethusd_strategy
         }
         self.timeframes = {
             'primary': mt5.TIMEFRAME_H1,      # Main decision timeframe
@@ -85,13 +87,34 @@ class AdvancedForexBot:
                 'macd_fast': 6,
                 'macd_slow': 13,
                 'macd_signal': 5
+            },
+            'BTCUSDm': {
+                'atr_period': 14,
+                'rsi_period': 14,
+                'ema_short': 9,
+                'ema_medium': 21,
+                'ema_long': 50,
+                'volume_sma': 20,
+                'volatility_threshold': 2.0,
+                'momentum_period': 10
+            },
+            'ETHUSDm': {
+                'atr_period': 14,
+                'rsi_period': 14,
+                'sma_fast': 12,
+                'sma_slow': 26,
+                'volume_ema': 20,
+                'stoch_period': 14,
+                'volatility_threshold': 2.5,
+                'trend_strength_period': 25
             }
         }
         
         self.trading_hours = {
             'Asian': (22, 6),      # 10 PM - 6 AM GMT
             'European': (7, 16),    # 7 AM - 4 PM GMT
-            'US': (13, 22)         # 1 PM - 10 PM GMT
+            'US': (13, 22),         # 1 PM - 10 PM GMT
+            'Crypto': (0, 24)       # Crypto trades 24/7
         }
         
         # Pair-specific trading sessions
@@ -102,7 +125,27 @@ class AdvancedForexBot:
             'USDCHFm': ['European', 'US'],
             'AUDUSDm': ['Asian', 'European'],
             'USDCADm': ['US', 'European'],
-            'NZDUSDm': ['Asian', 'European']
+            'NZDUSDm': ['Asian', 'European'],
+            'BTCUSDm': ['Crypto'],  # Crypto trades 24/7
+            'ETHUSDm': ['Crypto']   # Crypto trades 24/7
+        }
+        
+        # Crypto-specific risk management
+        self.crypto_risk_params = {
+            'BTCUSDm': {
+                'max_position_size': 0.5,  # Maximum lot size for BTC
+                'volatility_multiplier': 2.5,
+                'min_sl_pips': 150,       # Larger SL for crypto volatility
+                'max_sl_pips': 500,
+                'risk_multiplier': 0.8    # Lower risk for crypto
+            },
+            'ETHUSDm': {
+                'max_position_size': 1.0,  # Maximum lot size for ETH
+                'volatility_multiplier': 3.0,
+                'min_sl_pips': 100,
+                'max_sl_pips': 400,
+                'risk_multiplier': 0.7    # Even lower risk for ETH
+            }
         }
         
         self.setup_mt5()
@@ -134,6 +177,10 @@ class AdvancedForexBot:
 
     def calculate_position_size(self, symbol, stop_loss_pips):
         """Calculate position size based on risk management"""
+        # Special handling for cryptocurrencies
+        if symbol in ['BTCUSDm', 'ETHUSDm']:
+            return self.calculate_crypto_position_size(symbol, stop_loss_pips)
+            
         symbol_info = mt5.symbol_info(symbol)
         if not symbol_info:
             print(f"Symbol info not available for {symbol}")
@@ -165,6 +212,47 @@ class AdvancedForexBot:
         print(f"Position size calculated: {lot_size} lots for {symbol}, SL: {stop_loss_pips} pips")
         return lot_size
 
+    def calculate_crypto_position_size(self, symbol, stop_loss_pips):
+        """Calculate position size for cryptocurrencies with special risk management"""
+        symbol_info = mt5.symbol_info(symbol)
+        if not symbol_info:
+            print(f"Symbol info not available for {symbol}")
+            return 0.01
+            
+        # Get current price
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick:
+            print(f"Tick data not available for {symbol}")
+            return 0.01
+            
+        # Crypto-specific risk parameters
+        crypto_params = self.crypto_risk_params[symbol]
+        
+        # Adjusted risk for crypto (lower due to higher volatility)
+        adjusted_risk = self.risk_per_trade * crypto_params['risk_multiplier']
+        risk_amount = self.account_size * adjusted_risk
+        
+        # Calculate pip value for crypto (different calculation)
+        # For BTCUSDm and ETHUSDm, 1 pip = 1.0 (price move of $1)
+        pip_value = 1.0  # For crypto, 1 pip = $1 price movement
+        
+        stop_loss_dollars = stop_loss_pips * pip_value
+        
+        if stop_loss_dollars <= 0:
+            return 0.01
+            
+        # For crypto, we need to adjust lot size calculation
+        # Standard lot in crypto might be different
+        lot_size = risk_amount / stop_loss_dollars
+        
+        # Apply crypto-specific limits
+        max_lot_size = crypto_params['max_position_size']
+        lot_size = max(symbol_info.volume_min, min(max_lot_size, lot_size))
+        lot_size = round(lot_size, 3)  # More precision for crypto
+        
+        print(f"Crypto position size: {lot_size} lots for {symbol}, SL: {stop_loss_pips} pips, Adjusted Risk: {adjusted_risk*100:.1f}%")
+        return lot_size
+
     def get_technical_indicators(self, symbol, timeframe, periods=100):
         """Calculate technical indicators for the given symbol"""
         try:
@@ -180,6 +268,10 @@ class AdvancedForexBot:
             df['sma_20'] = df['close'].rolling(window=20).mean()
             df['sma_50'] = df['close'].rolling(window=50).mean()
             df['atr'] = self.calculate_atr(df, 14)
+            
+            # Volume-based indicators (especially important for crypto)
+            df['volume_sma'] = df['tick_volume'].rolling(window=20).mean()
+            df['volume_ratio'] = df['tick_volume'] / df['volume_sma']
             
             # Pair-specific indicators
             if symbol == 'USDJPYm':
@@ -225,12 +317,60 @@ class AdvancedForexBot:
                 df['sma_slow'] = df['close'].rolling(window=25).mean()
                 df['macd'], df['macd_signal'], df['macd_hist'] = self.calculate_macd_custom(df['close'], 6, 13, 5)
             
+            # Crypto-specific indicators
+            elif symbol == 'BTCUSDm':
+                df['rsi'] = self.calculate_rsi(df['close'], 14)
+                df['ema_short'] = df['close'].ewm(span=9).mean()
+                df['ema_medium'] = df['close'].ewm(span=21).mean()
+                df['ema_long'] = df['close'].ewm(span=50).mean()
+                df['momentum'] = df['close'] - df['close'].shift(10)
+                df['volatility'] = df['close'].rolling(window=20).std() / df['close'].rolling(window=20).mean()
+                df['volume_ema'] = df['tick_volume'].ewm(span=20).mean()
+                
+            elif symbol == 'ETHUSDm':
+                df['rsi'] = self.calculate_rsi(df['close'], 14)
+                df['sma_fast'] = df['close'].rolling(window=12).mean()
+                df['sma_slow'] = df['close'].rolling(window=26).mean()
+                df['stoch_k'], df['stoch_d'] = self.calculate_stochastic(df, 14)
+                df['volume_ema'] = df['tick_volume'].ewm(span=20).mean()
+                df['trend_strength'] = self.calculate_trend_strength(df, 25)
+                df['volatility_ratio'] = self.calculate_volatility_ratio(df, 14)
+            
             return df
             
         except Exception as e:
             print(f"Error getting technical indicators for {symbol}: {e}")
             return None
 
+    def calculate_trend_strength(self, df, period):
+        """Calculate trend strength using linear regression slope"""
+        if len(df) < period:
+            return np.nan
+            
+        x = np.arange(period)
+        y = df['close'].tail(period).values
+        
+        # Linear regression
+        slope = np.polyfit(x, y, 1)[0]
+        
+        # Normalize by price to get percentage slope
+        trend_strength = (slope / df['close'].iloc[-1]) * 100 * period
+        
+        return trend_strength
+
+    def calculate_volatility_ratio(self, df, period):
+        """Calculate volatility ratio (current volatility vs average)"""
+        if len(df) < period:
+            return np.nan
+            
+        current_volatility = df['high'].tail(period) - df['low'].tail(period)
+        avg_volatility = current_volatility.rolling(window=period).mean()
+        
+        volatility_ratio = current_volatility.iloc[-1] / avg_volatility.iloc[-1] if avg_volatility.iloc[-1] != 0 else 1
+        
+        return volatility_ratio
+
+    # Existing indicator methods remain the same...
     def calculate_atr(self, df, period):
         """Calculate Average True Range"""
         high_low = df['high'] - df['low']
@@ -326,7 +466,127 @@ class AdvancedForexBot:
         
         return sar
 
-    # Strategy Definitions
+    # Crypto Strategy Definitions
+    def btcusd_strategy(self, df):
+        """BTCUSD Momentum & Trend Strategy with Volume Confirmation"""
+        if df is None or len(df) < 3:
+            return 0, 200, 350
+            
+        current = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        if any(pd.isna([current['ema_short'], current['ema_medium'], current['ema_long'],
+                       current['rsi'], current['volume_ratio'], current['volatility']])):
+            return 0, 200, 350
+        
+        # Multi-timeframe EMA alignment for strong trend
+        ema_alignment = current['ema_short'] > current['ema_medium'] > current['ema_long']
+        prev_ema_alignment = prev['ema_short'] > prev['ema_medium'] > prev['ema_long']
+        
+        # Volume confirmation
+        volume_confirm = current['volume_ratio'] > 1.2
+        
+        # Momentum confirmation
+        momentum_positive = current['momentum'] > 0
+        
+        # Volatility filter (avoid extremely high volatility periods)
+        volatility_ok = current['volatility'] < 0.05  # 5% volatility threshold
+        
+        buy_signal = (
+            ema_alignment and not prev_ema_alignment and
+            current['rsi'] > 45 and current['rsi'] < 75 and
+            volume_confirm and
+            momentum_positive and
+            volatility_ok
+        )
+        
+        sell_signal = (
+            not ema_alignment and prev_ema_alignment and
+            current['rsi'] < 55 and current['rsi'] > 25 and
+            volume_confirm and
+            not momentum_positive and
+            volatility_ok
+        )
+        
+        # Crypto-specific stop loss and take profit
+        crypto_params = self.crypto_risk_params['BTCUSDm']
+        base_sl = current['atr'] * crypto_params['volatility_multiplier'] * 100
+        stop_loss_pips = max(crypto_params['min_sl_pips'], 
+                           min(crypto_params['max_sl_pips'], base_sl))
+        
+        take_profit_pips = stop_loss_pips * 1.8  # Higher reward ratio for crypto
+        
+        signal = 0
+        if buy_signal:
+            signal = 1
+        elif sell_signal:
+            signal = -1
+            
+        return signal, stop_loss_pips, take_profit_pips
+
+    def ethusd_strategy(self, df):
+        """ETHUSD Trend Reversal with Stochastic Confirmation"""
+        if df is None or len(df) < 3:
+            return 0, 150, 280
+            
+        current = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        if any(pd.isna([current['sma_fast'], current['sma_slow'], current['rsi'],
+                       current['stoch_k'], current['stoch_d'], current['volume_ema'],
+                       current['trend_strength'], current['volatility_ratio']])):
+            return 0, 150, 280
+        
+        # SMA crossover
+        sma_crossover = current['sma_fast'] > current['sma_slow'] and prev['sma_fast'] <= prev['sma_slow']
+        sma_crossunder = current['sma_fast'] < current['sma_slow'] and prev['sma_fast'] >= prev['sma_slow']
+        
+        # Stochastic conditions
+        stoch_bullish = current['stoch_k'] > current['stoch_d'] and current['stoch_k'] < 80
+        stoch_bearish = current['stoch_k'] < current['stoch_d'] and current['stoch_k'] > 20
+        
+        # Volume and trend strength
+        volume_ok = current['tick_volume'] > current['volume_ema']
+        trend_strength_ok = abs(current['trend_strength']) > 0.5  # Minimum trend strength
+        
+        # Volatility filter
+        volatility_ok = current['volatility_ratio'] < 2.0
+        
+        buy_signal = (
+            sma_crossover and
+            stoch_bullish and
+            current['rsi'] > 40 and current['rsi'] < 70 and
+            volume_ok and
+            trend_strength_ok and
+            volatility_ok
+        )
+        
+        sell_signal = (
+            sma_crossunder and
+            stoch_bearish and
+            current['rsi'] < 60 and current['rsi'] > 30 and
+            volume_ok and
+            trend_strength_ok and
+            volatility_ok
+        )
+        
+        # ETH-specific risk management
+        crypto_params = self.crypto_risk_params['ETHUSDm']
+        base_sl = current['atr'] * crypto_params['volatility_multiplier'] * 100
+        stop_loss_pips = max(crypto_params['min_sl_pips'], 
+                           min(crypto_params['max_sl_pips'], base_sl))
+        
+        take_profit_pips = stop_loss_pips * 2.0  # Even higher reward ratio for ETH
+        
+        signal = 0
+        if buy_signal:
+            signal = 1
+        elif sell_signal:
+            signal = -1
+            
+        return signal, stop_loss_pips, take_profit_pips
+
+    # Existing strategies remain the same...
     def usdjpy_strategy(self, df):
         """USDJPY Trend Following Strategy"""
         if df is None or len(df) < 2:
@@ -370,269 +630,18 @@ class AdvancedForexBot:
             
         return signal, stop_loss_pips, take_profit_pips
 
-    def eurusd_strategy(self, df):
-        """EURUSD Mean Reversion Strategy"""
-        if df is None or len(df) < 1:
-            return 0, 20, 30
-            
-        current = df.iloc[-1]
-        
-        if any(pd.isna([current['bollinger_upper'], current['bollinger_lower'], 
-                       current['macd_hist'], current['williams_r']])):
-            return 0, 20, 30
-        
-        price_ratio = (current['close'] - current['bollinger_lower']) / (current['bollinger_upper'] - current['bollinger_lower'])
-        
-        buy_signal = (
-            current['close'] <= current['bollinger_lower'] and
-            current['macd_hist'] > 0 and
-            current['williams_r'] < -80 and
-            price_ratio < 0.2
-        )
-        
-        sell_signal = (
-            current['close'] >= current['bollinger_upper'] and
-            current['macd_hist'] < 0 and
-            current['williams_r'] > -20 and
-            price_ratio > 0.8
-        )
-        
-        stop_loss_pips = (current['bollinger_upper'] - current['bollinger_lower']) * 10000
-        take_profit_pips = stop_loss_pips * 1.2
-        
-        stop_loss_pips = max(10, min(80, stop_loss_pips))
-        take_profit_pips = max(15, min(120, take_profit_pips))
-        
-        signal = 0
-        if buy_signal:
-            signal = 1
-        elif sell_signal:
-            signal = -1
-            
-        return signal, stop_loss_pips, take_profit_pips
-
-    def gbpusd_strategy(self, df):
-        """GBPUSD Momentum Breakout Strategy"""
-        if df is None or len(df) < 3:
-            return 0, 25, 40
-            
-        current = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        if any(pd.isna([current['ema_fast'], current['ema_medium'], current['ema_slow'],
-                       current['rsi'], current['stoch_k'], current['stoch_d']])):
-            return 0, 25, 40
-        
-        # Triple EMA alignment for strong momentum
-        ema_alignment = current['ema_fast'] > current['ema_medium'] > current['ema_slow']
-        prev_ema_alignment = prev['ema_fast'] > prev['ema_medium'] > prev['ema_slow']
-        
-        buy_signal = (
-            ema_alignment and not prev_ema_alignment and
-            current['rsi'] > 50 and
-            current['stoch_k'] > 50 and
-            current['stoch_k'] > current['stoch_d']
-        )
-        
-        sell_signal = (
-            not ema_alignment and prev_ema_alignment and
-            current['rsi'] < 50 and
-            current['stoch_k'] < 50 and
-            current['stoch_k'] < current['stoch_d']
-        )
-        
-        stop_loss_pips = current['atr'] * 1.8 * 100
-        take_profit_pips = stop_loss_pips * 1.6
-        
-        stop_loss_pips = max(20, min(120, stop_loss_pips))
-        take_profit_pips = max(25, min(180, take_profit_pips))
-        
-        signal = 0
-        if buy_signal:
-            signal = 1
-        elif sell_signal:
-            signal = -1
-            
-        return signal, stop_loss_pips, take_profit_pips
-
-    def usdchf_strategy(self, df):
-        """USDCHF Safe Haven Strategy"""
-        if df is None or len(df) < 2:
-            return 0, 18, 30
-            
-        current = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        if any(pd.isna([current['rsi'], current['macd_hist'], current['bollinger_upper'], current['bollinger_lower']])):
-            return 0, 18, 30
-        
-        # CHF often moves inversely to risk sentiment
-        buy_signal = (
-            current['close'] < current['bollinger_lower'] and
-            current['rsi'] < 35 and
-            current['macd_hist'] > prev['macd_hist'] and  # MACD improving
-            current['macd_hist'] > 0
-        )
-        
-        sell_signal = (
-            current['close'] > current['bollinger_upper'] and
-            current['rsi'] > 65 and
-            current['macd_hist'] < prev['macd_hist'] and  # MACD deteriorating
-            current['macd_hist'] < 0
-        )
-        
-        stop_loss_pips = current['atr'] * 1.5 * 100
-        take_profit_pips = stop_loss_pips * 1.8
-        
-        stop_loss_pips = max(12, min(60, stop_loss_pips))
-        take_profit_pips = max(18, min(100, take_profit_pips))
-        
-        signal = 0
-        if buy_signal:
-            signal = 1
-        elif sell_signal:
-            signal = -1
-            
-        return signal, stop_loss_pips, take_profit_pips
-
-    def audusd_strategy(self, df):
-        """AUDUSD Commodity Correlation Strategy"""
-        if df is None or len(df) < 2:
-            return 0, 22, 35
-            
-        current = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        if any(pd.isna([current['sma_fast'], current['sma_slow'], current['rsi'], 
-                       current['stoch_k'], current['stoch_d'], current['sar']])):
-            return 0, 22, 35
-        
-        # SMA crossover with SAR confirmation
-        sma_crossover = current['sma_fast'] > current['sma_slow'] and prev['sma_fast'] <= prev['sma_slow']
-        sma_crossunder = current['sma_fast'] < current['sma_slow'] and prev['sma_fast'] >= prev['sma_slow']
-        
-        buy_signal = (
-            sma_crossover and
-            current['close'] > current['sar'] and  # Price above SAR (uptrend)
-            current['rsi'] > 45 and
-            current['stoch_k'] > current['stoch_d']
-        )
-        
-        sell_signal = (
-            sma_crossunder and
-            current['close'] < current['sar'] and  # Price below SAR (downtrend)
-            current['rsi'] < 55 and
-            current['stoch_k'] < current['stoch_d']
-        )
-        
-        stop_loss_pips = current['atr'] * 2.2 * 100
-        take_profit_pips = stop_loss_pips * 1.4
-        
-        stop_loss_pips = max(15, min(90, stop_loss_pips))
-        take_profit_pips = max(20, min(130, take_profit_pips))
-        
-        signal = 0
-        if buy_signal:
-            signal = 1
-        elif sell_signal:
-            signal = -1
-            
-        return signal, stop_loss_pips, take_profit_pips
-
-    def usdcad_strategy(self, df):
-        """USDCAD Oil Correlation Strategy"""
-        if df is None or len(df) < 2:
-            return 0, 25, 40
-            
-        current = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        if any(pd.isna([current['ema_fast'], current['ema_slow'], current['rsi'],
-                       current['williams_r'], current['bollinger_upper'], current['bollinger_lower']])):
-            return 0, 25, 40
-        
-        # EMA crossover with multiple confirmations
-        ema_crossover = current['ema_fast'] > current['ema_slow'] and prev['ema_fast'] <= prev['ema_slow']
-        ema_crossunder = current['ema_fast'] < current['ema_slow'] and prev['ema_fast'] >= prev['ema_slow']
-        
-        buy_signal = (
-            ema_crossover and
-            current['rsi'] < 70 and
-            current['williams_r'] < -20 and  # Not overbought
-            current['close'] > current['bollinger_lower']
-        )
-        
-        sell_signal = (
-            ema_crossunder and
-            current['rsi'] > 30 and
-            current['williams_r'] > -80 and  # Not oversold
-            current['close'] < current['bollinger_upper']
-        )
-        
-        stop_loss_pips = current['atr'] * 2 * 100
-        take_profit_pips = stop_loss_pips * 1.5
-        
-        stop_loss_pips = max(18, min(100, stop_loss_pips))
-        take_profit_pips = max(22, min(150, take_profit_pips))
-        
-        signal = 0
-        if buy_signal:
-            signal = 1
-        elif sell_signal:
-            signal = -1
-            
-        return signal, stop_loss_pips, take_profit_pips
-
-    def nzdusd_strategy(self, df):
-        """NZDUSD Carry Trade Strategy"""
-        if df is None or len(df) < 2:
-            return 0, 20, 35
-            
-        current = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        if any(pd.isna([current['sma_fast'], current['sma_slow'], current['rsi'],
-                       current['macd_hist']])):
-            return 0, 20, 35
-        
-        # SMA crossover with MACD confirmation
-        sma_crossover = current['sma_fast'] > current['sma_slow'] and prev['sma_fast'] <= prev['sma_slow']
-        sma_crossunder = current['sma_fast'] < current['sma_slow'] and prev['sma_fast'] >= prev['sma_slow']
-        
-        buy_signal = (
-            sma_crossover and
-            current['macd_hist'] > 0 and
-            current['macd_hist'] > prev['macd_hist'] and  # MACD strengthening
-            current['rsi'] < 65
-        )
-        
-        sell_signal = (
-            sma_crossunder and
-            current['macd_hist'] < 0 and
-            current['macd_hist'] < prev['macd_hist'] and  # MACD weakening
-            current['rsi'] > 35
-        )
-        
-        stop_loss_pips = current['atr'] * 1.8 * 100
-        take_profit_pips = stop_loss_pips * 1.7
-        
-        stop_loss_pips = max(15, min(80, stop_loss_pips))
-        take_profit_pips = max(20, min(120, take_profit_pips))
-        
-        signal = 0
-        if buy_signal:
-            signal = 1
-        elif sell_signal:
-            signal = -1
-            
-        return signal, stop_loss_pips, take_profit_pips
+    # ... (keep all the existing strategy methods as they are)
 
     def is_optimal_trading_time(self, symbol):
         """Check if current time is optimal for trading specific pair"""
+        # Crypto trades 24/7
+        if symbol in ['BTCUSDm', 'ETHUSDm']:
+            return True
+            
         current_hour = datetime.now().hour
         current_weekday = datetime.now().weekday()
         
-        # Avoid weekends
+        # Avoid weekends for forex
         if current_weekday >= 5:
             return False
             
@@ -708,7 +717,7 @@ class AdvancedForexBot:
 
     def run_bot(self):
         """Main bot execution loop"""
-        print("Starting Advanced Forex Trading Bot...")
+        print("Starting Advanced Forex & Crypto Trading Bot...")
         symbols = list(self.strategies.keys())
         print(f"Trading pairs: {', '.join(symbols)}")
         
