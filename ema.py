@@ -2,1076 +2,810 @@ import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
 import time
-from datetime import datetime, timedelta
 import threading
-from collections import deque
-import warnings
-warnings.filterwarnings('ignore')
+import json
+import os
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, asdict
+from enum import Enum
+import logging
 
-class AdvancedForexBot:
-    def __init__(self, account_size, risk_per_trade=0.01):
-        self.account_size = account_size
-        self.risk_per_trade = risk_per_trade
-        self.positions = {}
-        
-        # Initialize strategies dictionary after all methods are defined
-        self.strategies = {}
-        
-        self.timeframes = {
-            'primary': mt5.TIMEFRAME_H1,      # Main decision timeframe
-            'confirmation': mt5.TIMEFRAME_M15 # Confirmation timeframe
-        }
-        
-        # Strategy parameters for all pairs
-        self.params = {
-            'USDJPYm': {
-                'atr_period': 14,
-                'rsi_period': 14,
-                'ema_fast': 8,
-                'ema_slow': 21,
-                'bollinger_period': 20,
-                'stoch_period': 14
-            },
-            'EURUSDm': {
-                'atr_period': 14,
-                'rsi_period': 14,
-                'macd_fast': 12,
-                'macd_slow': 26,
-                'macd_signal': 9,
-                'williams_period': 14
-            },
-            'GBPUSDm': {
-                'atr_period': 14,
-                'rsi_period': 14,
-                'ema_fast': 5,
-                'ema_medium': 13,
-                'ema_slow': 21,
-                'stoch_period': 14
-            },
-            'USDCHFm': {
-                'atr_period': 14,
-                'rsi_period': 14,
-                'macd_fast': 8,
-                'macd_slow': 21,
-                'macd_signal': 5,
-                'bollinger_period': 20
-            },
-            'AUDUSDm': {
-                'atr_period': 14,
-                'rsi_period': 14,
-                'sma_fast': 10,
-                'sma_slow': 30,
-                'parabolic_sar': 0.02,
-                'stoch_period': 14
-            },
-            'USDCADm': {
-                'atr_period': 14,
-                'rsi_period': 14,
-                'ema_fast': 9,
-                'ema_slow': 18,
-                'bollinger_period': 20,
-                'williams_period': 14
-            },
-            'NZDUSDm': {
-                'atr_period': 14,
-                'rsi_period': 14,
-                'sma_fast': 7,
-                'sma_slow': 25,
-                'macd_fast': 6,
-                'macd_slow': 13,
-                'macd_signal': 5
-            },
-            'BTCUSDm': {
-                'atr_period': 14,
-                'rsi_period': 14,
-                'ema_short': 9,
-                'ema_medium': 21,
-                'ema_long': 50,
-                'volume_sma': 20,
-                'volatility_threshold': 2.0,
-                'momentum_period': 10
-            },
-            'ETHUSDm': {
-                'atr_period': 14,
-                'rsi_period': 14,
-                'sma_fast': 12,
-                'sma_slow': 26,
-                'volume_ema': 20,
-                'stoch_period': 14,
-                'volatility_threshold': 2.5,
-                'trend_strength_period': 25
-            }
-        }
-        
-        self.trading_hours = {
-            'Asian': (22, 6),      # 10 PM - 6 AM GMT
-            'European': (7, 16),    # 7 AM - 4 PM GMT
-            'US': (13, 22),         # 1 PM - 10 PM GMT
-            'Crypto': (0, 24)       # Crypto trades 24/7
-        }
-        
-        # Pair-specific trading sessions
-        self.pair_sessions = {
-            'USDJPYm': ['Asian', 'US'],
-            'EURUSDm': ['European', 'US'],
-            'GBPUSDm': ['European', 'US'],
-            'USDCHFm': ['European', 'US'],
-            'AUDUSDm': ['Asian', 'European'],
-            'USDCADm': ['US', 'European'],
-            'NZDUSDm': ['Asian', 'European'],
-            'BTCUSDm': ['Crypto'],  # Crypto trades 24/7
-            'ETHUSDm': ['Crypto']   # Crypto trades 24/7
-        }
-        
-        # Crypto-specific risk management
-        self.crypto_risk_params = {
-            'BTCUSDm': {
-                'max_position_size': 0.5,  # Maximum lot size for BTC
-                'volatility_multiplier': 2.5,
-                'min_sl_pips': 150,       # Larger SL for crypto volatility
-                'max_sl_pips': 500,
-                'risk_multiplier': 0.8    # Lower risk for crypto
-            },
-            'ETHUSDm': {
-                'max_position_size': 1.0,  # Maximum lot size for ETH
-                'volatility_multiplier': 3.0,
-                'min_sl_pips': 100,
-                'max_sl_pips': 400,
-                'risk_multiplier': 0.7    # Even lower risk for ETH
-            }
-        }
-        
-        self.setup_mt5()
-        # Initialize strategies after all methods are defined
-        self._initialize_strategies()
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('hft_bot.log'),
+        logging.StreamHandler()
+    ]
+)
+
+class TradingPair(Enum):
+    BTCUSDm = "BTCUSDm"
+    ETHUSDm = "ETHUSDm" 
+    XAUUSDm = "XAUUSDm"
+
+class OrderSide(Enum):
+    BUY = mt5.ORDER_TYPE_BUY
+    SELL = mt5.ORDER_TYPE_SELL
+
+@dataclass
+class TradeSignal:
+    pair: TradingPair
+    side: OrderSide
+    entry_price: float
+    timestamp: float
+    signal_strength: float
+    volume: float
+
+@dataclass
+class PositionData:
+    ticket: int
+    symbol: str
+    type: int
+    volume: float
+    entry_price: float
+    current_price: float
+    profit: float
+    open_time: datetime
+
+@dataclass
+class BotConfig:
+    # Trading Parameters
+    profit_target: float = 0.0015      # 0.15%
+    stop_loss: float = 0.0010          # 0.10%
+    max_position_size: float = 0.1     # Default position size
+    max_positions: int = 3             # Max concurrent positions
+    max_daily_trades: int = 200        # Daily trade limit
     
-    def _initialize_strategies(self):
-        """Initialize strategies dictionary after all methods are defined"""
-        self.strategies = {
-            'USDJPYm': self.usdjpy_strategy,
-            'EURUSDm': self.eurusd_strategy,
-            'GBPUSDm': self.gbpusd_strategy,
-            'USDCHFm': self.usdchf_strategy,
-            'AUDUSDm': self.audusd_strategy,
-            'USDCADm': self.usdcad_strategy,
-            'NZDUSDm': self.nzdusd_strategy,
-            'BTCUSDm': self.btcusd_strategy,
-            'ETHUSDm': self.ethusd_strategy
+    # Strategy Parameters
+    momentum_period: int = 5
+    rsi_period: int = 14
+    volatility_period: int = 10
+    min_volatility: float = 0.0002
+    max_volatility: float = 0.005
+    
+    # Risk Management
+    max_drawdown: float = 0.05         # 5% max drawdown
+    risk_per_trade: float = 0.01       # 1% risk per trade
+    equity_protection: float = 0.8     # Stop if equity < 80% balance
+    
+    # Execution
+    update_interval: float = 0.05      # 20Hz update
+    data_points: int = 100             # Data points to keep
+
+class MT5HFTBot:
+    def __init__(self, account: int, password: str, server: str):
+        self.account = account
+        self.password = password
+        self.server = server
+        self.config = BotConfig()
+        
+        # Initialize state
+        self.is_running = False
+        self.trading_active = True
+        self.last_reset = datetime.now().date()
+        
+        # Data storage
+        self.price_data: Dict[str, List[float]] = {}
+        self.volume_data: Dict[str, List[float]] = {}
+        self.last_update: Dict[str, float] = {}
+        
+        # Trading state
+        self.active_pairs: Dict[TradingPair, bool] = {
+            TradingPair.BTCUSDm: True,
+            TradingPair.ETHUSDm: True,
+            TradingPair.XAUUSDm: True
         }
+        
+        # Performance tracking
+        self.daily_trades = 0
+        self.total_trades = 0
+        self.total_profit = 0.0
+        self.closed_profit = 0.0
+        self.open_profit = 0.0
+        
+        # Threading
+        self.trading_thread = None
+        self.monitor_thread = None
+        
+        # Initialize MT5
+        self._initialize_mt5()
+        
+        # Load configuration
+        self.load_config()
+        
+        logging.info("MT5 HFT Bot initialized")
 
-    def setup_mt5(self):
-        """Initialize MT5 connection"""
-        if not mt5.initialize():
-            print("MT5 initialization failed")
-            return False
-        
-        # Verify connection
-        if not mt5.terminal_info():
-            print("MT5 terminal not connected")
-            return False
-            
-        print("MT5 initialized successfully")
-        
-        # Enable symbol trading and subscribe to symbols
-        symbols = ['USDJPYm', 'EURUSDm', 'GBPUSDm', 'USDCHFm', 'AUDUSDm', 'USDCADm', 'NZDUSDm', 'BTCUSDm', 'ETHUSDm']
-        for symbol in symbols:
-            # Select the symbol
-            selected = mt5.symbol_select(symbol, True)
-            if selected:
-                print(f"Symbol {symbol} enabled successfully")
-            else:
-                print(f"Failed to enable {symbol}, error: {mt5.last_error()}")
-            
-        return True
-
-    def calculate_position_size(self, symbol, stop_loss_pips):
-        """Calculate position size based on risk management"""
-        # Special handling for cryptocurrencies
-        if symbol in ['BTCUSDm', 'ETHUSDm']:
-            return self.calculate_crypto_position_size(symbol, stop_loss_pips)
-            
-        symbol_info = mt5.symbol_info(symbol)
-        if not symbol_info:
-            print(f"Symbol info not available for {symbol}")
-            return 0.01  # Default minimum lot size
-        
-        # Get current price
-        tick = mt5.symbol_info_tick(symbol)
-        if not tick:
-            print(f"Tick data not available for {symbol}")
-            return 0.01
-            
-        # Calculate pip value
-        pip_size = 0.01 if 'JPY' in symbol else 0.0001
-        pip_value = (0.0001 / tick.ask) * 100000 if 'JPY' not in symbol else (0.01 / tick.ask) * 100000
-        
-        # Risk calculation
-        risk_amount = self.account_size * self.risk_per_trade
-        stop_loss_dollars = stop_loss_pips * pip_value
-        
-        if stop_loss_dollars <= 0:
-            return 0.01
-            
-        lot_size = risk_amount / stop_loss_dollars
-        
-        # Ensure lot size is within broker limits
-        lot_size = max(symbol_info.volume_min, min(symbol_info.volume_max, lot_size))
-        lot_size = round(lot_size, 2)
-        
-        print(f"Position size calculated: {lot_size} lots for {symbol}, SL: {stop_loss_pips} pips")
-        return lot_size
-
-    def calculate_crypto_position_size(self, symbol, stop_loss_pips):
-        """Calculate position size for cryptocurrencies with special risk management"""
-        symbol_info = mt5.symbol_info(symbol)
-        if not symbol_info:
-            print(f"Symbol info not available for {symbol}")
-            return 0.01
-            
-        # Get current price
-        tick = mt5.symbol_info_tick(symbol)
-        if not tick:
-            print(f"Tick data not available for {symbol}")
-            return 0.01
-            
-        # Crypto-specific risk parameters
-        crypto_params = self.crypto_risk_params[symbol]
-        
-        # Adjusted risk for crypto (lower due to higher volatility)
-        adjusted_risk = self.risk_per_trade * crypto_params['risk_multiplier']
-        risk_amount = self.account_size * adjusted_risk
-        
-        # Calculate pip value for crypto (different calculation)
-        # For BTCUSDm and ETHUSDm, 1 pip = 1.0 (price move of $1)
-        pip_value = 1.0  # For crypto, 1 pip = $1 price movement
-        
-        stop_loss_dollars = stop_loss_pips * pip_value
-        
-        if stop_loss_dollars <= 0:
-            return 0.01
-            
-        # For crypto, we need to adjust lot size calculation
-        # Standard lot in crypto might be different
-        lot_size = risk_amount / stop_loss_dollars
-        
-        # Apply crypto-specific limits
-        max_lot_size = crypto_params['max_position_size']
-        lot_size = max(symbol_info.volume_min, min(max_lot_size, lot_size))
-        lot_size = round(lot_size, 3)  # More precision for crypto
-        
-        print(f"Crypto position size: {lot_size} lots for {symbol}, SL: {stop_loss_pips} pips, Adjusted Risk: {adjusted_risk*100:.1f}%")
-        return lot_size
-
-    def get_technical_indicators(self, symbol, timeframe, periods=100):
-        """Calculate technical indicators for the given symbol"""
+    def _initialize_mt5(self) -> bool:
+        """Initialize connection to MT5"""
         try:
-            rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, periods)
-            if rates is None or len(rates) == 0:
-                print(f"No data received for {symbol} on timeframe {timeframe}")
-                return None
+            if not mt5.initialize():
+                logging.error(f"MT5 initialization failed: {mt5.last_error()}")
+                return False
                 
-            df = pd.DataFrame(rates)
-            df['time'] = pd.to_datetime(df['time'], unit='s')
-            
-            # Common indicators for all pairs
-            df['sma_20'] = df['close'].rolling(window=20).mean()
-            df['sma_50'] = df['close'].rolling(window=50).mean()
-            df['atr'] = self.calculate_atr(df, 14)
-            
-            # Volume-based indicators (especially important for crypto)
-            df['volume_sma'] = df['tick_volume'].rolling(window=20).mean()
-            df['volume_ratio'] = df['tick_volume'] / df['volume_sma']
-            
-            # Pair-specific indicators
-            if symbol == 'USDJPYm':
-                df['rsi'] = self.calculate_rsi(df['close'], 14)
-                df['ema_fast'] = df['close'].ewm(span=8).mean()
-                df['ema_slow'] = df['close'].ewm(span=21).mean()
-                df['stoch_k'], df['stoch_d'] = self.calculate_stochastic(df, 14)
+            if not mt5.login(self.account, password=self.password, server=self.server):
+                logging.error(f"MT5 login failed: {mt5.last_error()}")
+                return False
                 
-            elif symbol == 'EURUSDm':
-                df['macd'], df['macd_signal'], df['macd_hist'] = self.calculate_macd(df['close'])
-                df['williams_r'] = self.calculate_williams_r(df, 14)
-                df['bollinger_upper'], df['bollinger_lower'] = self.calculate_bollinger_bands(df['close'], 20)
-            
-            elif symbol == 'GBPUSDm':
-                df['rsi'] = self.calculate_rsi(df['close'], 14)
-                df['ema_fast'] = df['close'].ewm(span=5).mean()
-                df['ema_medium'] = df['close'].ewm(span=13).mean()
-                df['ema_slow'] = df['close'].ewm(span=21).mean()
-                df['stoch_k'], df['stoch_d'] = self.calculate_stochastic(df, 14)
-                
-            elif symbol == 'USDCHFm':
-                df['rsi'] = self.calculate_rsi(df['close'], 14)
-                df['macd'], df['macd_signal'], df['macd_hist'] = self.calculate_macd_custom(df['close'], 8, 21, 5)
-                df['bollinger_upper'], df['bollinger_lower'] = self.calculate_bollinger_bands(df['close'], 20)
-                
-            elif symbol == 'AUDUSDm':
-                df['rsi'] = self.calculate_rsi(df['close'], 14)
-                df['sma_fast'] = df['close'].rolling(window=10).mean()
-                df['sma_slow'] = df['close'].rolling(window=30).mean()
-                df['stoch_k'], df['stoch_d'] = self.calculate_stochastic(df, 14)
-                df['sar'] = self.calculate_parabolic_sar(df)
-                
-            elif symbol == 'USDCADm':
-                df['rsi'] = self.calculate_rsi(df['close'], 14)
-                df['ema_fast'] = df['close'].ewm(span=9).mean()
-                df['ema_slow'] = df['close'].ewm(span=18).mean()
-                df['bollinger_upper'], df['bollinger_lower'] = self.calculate_bollinger_bands(df['close'], 20)
-                df['williams_r'] = self.calculate_williams_r(df, 14)
-                
-            elif symbol == 'NZDUSDm':
-                df['rsi'] = self.calculate_rsi(df['close'], 14)
-                df['sma_fast'] = df['close'].rolling(window=7).mean()
-                df['sma_slow'] = df['close'].rolling(window=25).mean()
-                df['macd'], df['macd_signal'], df['macd_hist'] = self.calculate_macd_custom(df['close'], 6, 13, 5)
-            
-            # Crypto-specific indicators
-            elif symbol == 'BTCUSDm':
-                df['rsi'] = self.calculate_rsi(df['close'], 14)
-                df['ema_short'] = df['close'].ewm(span=9).mean()
-                df['ema_medium'] = df['close'].ewm(span=21).mean()
-                df['ema_long'] = df['close'].ewm(span=50).mean()
-                df['momentum'] = df['close'] - df['close'].shift(10)
-                df['volatility'] = df['close'].rolling(window=20).std() / df['close'].rolling(window=20).mean()
-                df['volume_ema'] = df['tick_volume'].ewm(span=20).mean()
-                
-            elif symbol == 'ETHUSDm':
-                df['rsi'] = self.calculate_rsi(df['close'], 14)
-                df['sma_fast'] = df['close'].rolling(window=12).mean()
-                df['sma_slow'] = df['close'].rolling(window=26).mean()
-                df['stoch_k'], df['stoch_d'] = self.calculate_stochastic(df, 14)
-                df['volume_ema'] = df['tick_volume'].ewm(span=20).mean()
-                df['trend_strength'] = self.calculate_trend_strength(df, 25)
-                df['volatility_ratio'] = self.calculate_volatility_ratio(df, 14)
-            
-            return df
-            
-        except Exception as e:
-            print(f"Error getting technical indicators for {symbol}: {e}")
-            return None
-
-    def calculate_trend_strength(self, df, period):
-        """Calculate trend strength using linear regression slope"""
-        if len(df) < period:
-            return np.nan
-            
-        x = np.arange(period)
-        y = df['close'].tail(period).values
-        
-        # Linear regression
-        slope = np.polyfit(x, y, 1)[0]
-        
-        # Normalize by price to get percentage slope
-        trend_strength = (slope / df['close'].iloc[-1]) * 100 * period
-        
-        return trend_strength
-
-    def calculate_volatility_ratio(self, df, period):
-        """Calculate volatility ratio (current volatility vs average)"""
-        if len(df) < period:
-            return np.nan
-            
-        current_volatility = df['high'].tail(period) - df['low'].tail(period)
-        avg_volatility = current_volatility.rolling(window=period).mean()
-        
-        volatility_ratio = current_volatility.iloc[-1] / avg_volatility.iloc[-1] if avg_volatility.iloc[-1] != 0 else 1
-        
-        return volatility_ratio
-
-    # Existing indicator methods
-    def calculate_atr(self, df, period):
-        """Calculate Average True Range"""
-        high_low = df['high'] - df['low']
-        high_close = np.abs(df['high'] - df['close'].shift())
-        low_close = np.abs(df['low'] - df['close'].shift())
-        
-        true_range = np.maximum(np.maximum(high_low, high_close), low_close)
-        return true_range.rolling(window=period).mean()
-
-    def calculate_rsi(self, prices, period):
-        """Calculate Relative Strength Index"""
-        delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
-
-    def calculate_macd(self, prices):
-        """Calculate MACD with standard parameters"""
-        return self.calculate_macd_custom(prices, 12, 26, 9)
-
-    def calculate_macd_custom(self, prices, fast, slow, signal):
-        """Calculate MACD with custom parameters"""
-        exp1 = prices.ewm(span=fast).mean()
-        exp2 = prices.ewm(span=slow).mean()
-        macd = exp1 - exp2
-        macd_signal = macd.ewm(span=signal).mean()
-        macd_hist = macd - macd_signal
-        return macd, macd_signal, macd_hist
-
-    def calculate_stochastic(self, df, period):
-        """Calculate Stochastic Oscillator"""
-        low_min = df['low'].rolling(window=period).min()
-        high_max = df['high'].rolling(window=period).max()
-        stoch_k = 100 * ((df['close'] - low_min) / (high_max - low_min))
-        stoch_d = stoch_k.rolling(window=3).mean()
-        return stoch_k, stoch_d
-
-    def calculate_williams_r(self, df, period):
-        """Calculate Williams %R"""
-        high_max = df['high'].rolling(window=period).max()
-        low_min = df['low'].rolling(window=period).min()
-        williams_r = -100 * ((high_max - df['close']) / (high_max - low_min))
-        return williams_r
-
-    def calculate_bollinger_bands(self, prices, period):
-        """Calculate Bollinger Bands"""
-        sma = prices.rolling(window=period).mean()
-        std = prices.rolling(window=period).std()
-        upper_band = sma + (std * 2)
-        lower_band = sma - (std * 2)
-        return upper_band, lower_band
-
-    def calculate_parabolic_sar(self, df, acceleration=0.02, maximum=0.2):
-        """Calculate Parabolic SAR"""
-        high = df['high'].values
-        low = df['low'].values
-        close = df['close'].values
-        
-        sar = np.zeros(len(high))
-        ep = np.zeros(len(high))
-        af = np.zeros(len(high))
-        
-        # Initial values
-        sar[0] = high[0] if close[0] < close[1] else low[0]
-        ep[0] = high[0] if close[0] > close[1] else low[0]
-        af[0] = acceleration
-        
-        for i in range(1, len(high)):
-            # Update SAR
-            sar[i] = sar[i-1] + af[i-1] * (ep[i-1] - sar[i-1])
-            
-            # Check for SAR reversal
-            if close[i] > close[i-1]:
-                # Uptrend
-                if sar[i] > low[i]:
-                    sar[i] = min(low[i-1], low[i])
-                    af[i] = acceleration
-                    ep[i] = high[i]
-                else:
-                    af[i] = min(af[i-1] + acceleration, maximum)
-                    ep[i] = max(ep[i-1], high[i])
-            else:
-                # Downtrend
-                if sar[i] < high[i]:
-                    sar[i] = max(high[i-1], high[i])
-                    af[i] = acceleration
-                    ep[i] = low[i]
-                else:
-                    af[i] = min(af[i-1] + acceleration, maximum)
-                    ep[i] = min(ep[i-1], low[i])
-        
-        return sar
-
-    # Strategy Definitions
-    def usdjpy_strategy(self, df):
-        """USDJPY Trend Following Strategy"""
-        if df is None or len(df) < 2:
-            return 0, 30, 45
-            
-        current = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        if any(pd.isna([current['ema_fast'], current['ema_slow'], current['rsi'], 
-                       current['stoch_k'], current['stoch_d']])):
-            return 0, 30, 45
-        
-        ema_trend = current['ema_fast'] > current['ema_slow']
-        ema_prev_trend = prev['ema_fast'] > prev['ema_slow']
-        
-        buy_signal = (
-            ema_trend and not ema_prev_trend and
-            current['rsi'] < 70 and
-            current['stoch_k'] > current['stoch_d'] and
-            current['stoch_k'] < 80
-        )
-        
-        sell_signal = (
-            not ema_trend and ema_prev_trend and
-            current['rsi'] > 30 and
-            current['stoch_k'] < current['stoch_d'] and
-            current['stoch_k'] > 20
-        )
-        
-        stop_loss_pips = current['atr'] * 2 * 100
-        take_profit_pips = stop_loss_pips * 1.5
-        
-        stop_loss_pips = max(15, min(100, stop_loss_pips))
-        take_profit_pips = max(20, min(150, take_profit_pips))
-        
-        signal = 0
-        if buy_signal:
-            signal = 1
-        elif sell_signal:
-            signal = -1
-            
-        return signal, stop_loss_pips, take_profit_pips
-
-    def eurusd_strategy(self, df):
-        """EURUSD Mean Reversion Strategy"""
-        if df is None or len(df) < 1:
-            return 0, 20, 30
-            
-        current = df.iloc[-1]
-        
-        if any(pd.isna([current['bollinger_upper'], current['bollinger_lower'], 
-                       current['macd_hist'], current['williams_r']])):
-            return 0, 20, 30
-        
-        price_ratio = (current['close'] - current['bollinger_lower']) / (current['bollinger_upper'] - current['bollinger_lower'])
-        
-        buy_signal = (
-            current['close'] <= current['bollinger_lower'] and
-            current['macd_hist'] > 0 and
-            current['williams_r'] < -80 and
-            price_ratio < 0.2
-        )
-        
-        sell_signal = (
-            current['close'] >= current['bollinger_upper'] and
-            current['macd_hist'] < 0 and
-            current['williams_r'] > -20 and
-            price_ratio > 0.8
-        )
-        
-        stop_loss_pips = (current['bollinger_upper'] - current['bollinger_lower']) * 10000
-        take_profit_pips = stop_loss_pips * 1.2
-        
-        stop_loss_pips = max(10, min(80, stop_loss_pips))
-        take_profit_pips = max(15, min(120, take_profit_pips))
-        
-        signal = 0
-        if buy_signal:
-            signal = 1
-        elif sell_signal:
-            signal = -1
-            
-        return signal, stop_loss_pips, take_profit_pips
-
-    def gbpusd_strategy(self, df):
-        """GBPUSD Momentum Breakout Strategy"""
-        if df is None or len(df) < 3:
-            return 0, 25, 40
-            
-        current = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        if any(pd.isna([current['ema_fast'], current['ema_medium'], current['ema_slow'],
-                       current['rsi'], current['stoch_k'], current['stoch_d']])):
-            return 0, 25, 40
-        
-        # Triple EMA alignment for strong momentum
-        ema_alignment = current['ema_fast'] > current['ema_medium'] > current['ema_slow']
-        prev_ema_alignment = prev['ema_fast'] > prev['ema_medium'] > prev['ema_slow']
-        
-        buy_signal = (
-            ema_alignment and not prev_ema_alignment and
-            current['rsi'] > 50 and
-            current['stoch_k'] > 50 and
-            current['stoch_k'] > current['stoch_d']
-        )
-        
-        sell_signal = (
-            not ema_alignment and prev_ema_alignment and
-            current['rsi'] < 50 and
-            current['stoch_k'] < 50 and
-            current['stoch_k'] < current['stoch_d']
-        )
-        
-        stop_loss_pips = current['atr'] * 1.8 * 100
-        take_profit_pips = stop_loss_pips * 1.6
-        
-        stop_loss_pips = max(20, min(120, stop_loss_pips))
-        take_profit_pips = max(25, min(180, take_profit_pips))
-        
-        signal = 0
-        if buy_signal:
-            signal = 1
-        elif sell_signal:
-            signal = -1
-            
-        return signal, stop_loss_pips, take_profit_pips
-
-    def usdchf_strategy(self, df):
-        """USDCHF Safe Haven Strategy"""
-        if df is None or len(df) < 2:
-            return 0, 18, 30
-            
-        current = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        if any(pd.isna([current['rsi'], current['macd_hist'], current['bollinger_upper'], current['bollinger_lower']])):
-            return 0, 18, 30
-        
-        # CHF often moves inversely to risk sentiment
-        buy_signal = (
-            current['close'] < current['bollinger_lower'] and
-            current['rsi'] < 35 and
-            current['macd_hist'] > prev['macd_hist'] and  # MACD improving
-            current['macd_hist'] > 0
-        )
-        
-        sell_signal = (
-            current['close'] > current['bollinger_upper'] and
-            current['rsi'] > 65 and
-            current['macd_hist'] < prev['macd_hist'] and  # MACD deteriorating
-            current['macd_hist'] < 0
-        )
-        
-        stop_loss_pips = current['atr'] * 1.5 * 100
-        take_profit_pips = stop_loss_pips * 1.8
-        
-        stop_loss_pips = max(12, min(60, stop_loss_pips))
-        take_profit_pips = max(18, min(100, take_profit_pips))
-        
-        signal = 0
-        if buy_signal:
-            signal = 1
-        elif sell_signal:
-            signal = -1
-            
-        return signal, stop_loss_pips, take_profit_pips
-
-    def audusd_strategy(self, df):
-        """AUDUSD Commodity Correlation Strategy"""
-        if df is None or len(df) < 2:
-            return 0, 22, 35
-            
-        current = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        if any(pd.isna([current['sma_fast'], current['sma_slow'], current['rsi'], 
-                       current['stoch_k'], current['stoch_d'], current['sar']])):
-            return 0, 22, 35
-        
-        # SMA crossover with SAR confirmation
-        sma_crossover = current['sma_fast'] > current['sma_slow'] and prev['sma_fast'] <= prev['sma_slow']
-        sma_crossunder = current['sma_fast'] < current['sma_slow'] and prev['sma_fast'] >= prev['sma_slow']
-        
-        buy_signal = (
-            sma_crossover and
-            current['close'] > current['sar'] and  # Price above SAR (uptrend)
-            current['rsi'] > 45 and
-            current['stoch_k'] > current['stoch_d']
-        )
-        
-        sell_signal = (
-            sma_crossunder and
-            current['close'] < current['sar'] and  # Price below SAR (downtrend)
-            current['rsi'] < 55 and
-            current['stoch_k'] < current['stoch_d']
-        )
-        
-        stop_loss_pips = current['atr'] * 2.2 * 100
-        take_profit_pips = stop_loss_pips * 1.4
-        
-        stop_loss_pips = max(15, min(90, stop_loss_pips))
-        take_profit_pips = max(20, min(130, take_profit_pips))
-        
-        signal = 0
-        if buy_signal:
-            signal = 1
-        elif sell_signal:
-            signal = -1
-            
-        return signal, stop_loss_pips, take_profit_pips
-
-    def usdcad_strategy(self, df):
-        """USDCAD Oil Correlation Strategy"""
-        if df is None or len(df) < 2:
-            return 0, 25, 40
-            
-        current = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        if any(pd.isna([current['ema_fast'], current['ema_slow'], current['rsi'],
-                       current['williams_r'], current['bollinger_upper'], current['bollinger_lower']])):
-            return 0, 25, 40
-        
-        # EMA crossover with multiple confirmations
-        ema_crossover = current['ema_fast'] > current['ema_slow'] and prev['ema_fast'] <= prev['ema_slow']
-        ema_crossunder = current['ema_fast'] < current['ema_slow'] and prev['ema_fast'] >= prev['ema_slow']
-        
-        buy_signal = (
-            ema_crossover and
-            current['rsi'] < 70 and
-            current['williams_r'] < -20 and  # Not overbought
-            current['close'] > current['bollinger_lower']
-        )
-        
-        sell_signal = (
-            ema_crossunder and
-            current['rsi'] > 30 and
-            current['williams_r'] > -80 and  # Not oversold
-            current['close'] < current['bollinger_upper']
-        )
-        
-        stop_loss_pips = current['atr'] * 2 * 100
-        take_profit_pips = stop_loss_pips * 1.5
-        
-        stop_loss_pips = max(18, min(100, stop_loss_pips))
-        take_profit_pips = max(22, min(150, take_profit_pips))
-        
-        signal = 0
-        if buy_signal:
-            signal = 1
-        elif sell_signal:
-            signal = -1
-            
-        return signal, stop_loss_pips, take_profit_pips
-
-    def nzdusd_strategy(self, df):
-        """NZDUSD Carry Trade Strategy"""
-        if df is None or len(df) < 2:
-            return 0, 20, 35
-            
-        current = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        if any(pd.isna([current['sma_fast'], current['sma_slow'], current['rsi'],
-                       current['macd_hist']])):
-            return 0, 20, 35
-        
-        # SMA crossover with MACD confirmation
-        sma_crossover = current['sma_fast'] > current['sma_slow'] and prev['sma_fast'] <= prev['sma_slow']
-        sma_crossunder = current['sma_fast'] < current['sma_slow'] and prev['sma_fast'] >= prev['sma_slow']
-        
-        buy_signal = (
-            sma_crossover and
-            current['macd_hist'] > 0 and
-            current['macd_hist'] > prev['macd_hist'] and  # MACD strengthening
-            current['rsi'] < 65
-        )
-        
-        sell_signal = (
-            sma_crossunder and
-            current['macd_hist'] < 0 and
-            current['macd_hist'] < prev['macd_hist'] and  # MACD weakening
-            current['rsi'] > 35
-        )
-        
-        stop_loss_pips = current['atr'] * 1.8 * 100
-        take_profit_pips = stop_loss_pips * 1.7
-        
-        stop_loss_pips = max(15, min(80, stop_loss_pips))
-        take_profit_pips = max(20, min(120, take_profit_pips))
-        
-        signal = 0
-        if buy_signal:
-            signal = 1
-        elif sell_signal:
-            signal = -1
-            
-        return signal, stop_loss_pips, take_profit_pips
-
-    def btcusd_strategy(self, df):
-        """BTCUSD Momentum & Trend Strategy with Volume Confirmation"""
-        if df is None or len(df) < 3:
-            return 0, 200, 350
-            
-        current = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        if any(pd.isna([current['ema_short'], current['ema_medium'], current['ema_long'],
-                       current['rsi'], current['volume_ratio'], current['volatility']])):
-            return 0, 200, 350
-        
-        # Multi-timeframe EMA alignment for strong trend
-        ema_alignment = current['ema_short'] > current['ema_medium'] > current['ema_long']
-        prev_ema_alignment = prev['ema_short'] > prev['ema_medium'] > prev['ema_long']
-        
-        # Volume confirmation
-        volume_confirm = current['volume_ratio'] > 1.2
-        
-        # Momentum confirmation
-        momentum_positive = current['momentum'] > 0
-        
-        # Volatility filter (avoid extremely high volatility periods)
-        volatility_ok = current['volatility'] < 0.05  # 5% volatility threshold
-        
-        buy_signal = (
-            ema_alignment and not prev_ema_alignment and
-            current['rsi'] > 45 and current['rsi'] < 75 and
-            volume_confirm and
-            momentum_positive and
-            volatility_ok
-        )
-        
-        sell_signal = (
-            not ema_alignment and prev_ema_alignment and
-            current['rsi'] < 55 and current['rsi'] > 25 and
-            volume_confirm and
-            not momentum_positive and
-            volatility_ok
-        )
-        
-        # Crypto-specific stop loss and take profit
-        crypto_params = self.crypto_risk_params['BTCUSDm']
-        base_sl = current['atr'] * crypto_params['volatility_multiplier'] * 100
-        stop_loss_pips = max(crypto_params['min_sl_pips'], 
-                           min(crypto_params['max_sl_pips'], base_sl))
-        
-        take_profit_pips = stop_loss_pips * 1.8  # Higher reward ratio for crypto
-        
-        signal = 0
-        if buy_signal:
-            signal = 1
-        elif sell_signal:
-            signal = -1
-            
-        return signal, stop_loss_pips, take_profit_pips
-
-    def ethusd_strategy(self, df):
-        """ETHUSD Trend Reversal with Stochastic Confirmation"""
-        if df is None or len(df) < 3:
-            return 0, 150, 280
-            
-        current = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        if any(pd.isna([current['sma_fast'], current['sma_slow'], current['rsi'],
-                       current['stoch_k'], current['stoch_d'], current['volume_ema'],
-                       current['trend_strength'], current['volatility_ratio']])):
-            return 0, 150, 280
-        
-        # SMA crossover
-        sma_crossover = current['sma_fast'] > current['sma_slow'] and prev['sma_fast'] <= prev['sma_slow']
-        sma_crossunder = current['sma_fast'] < current['sma_slow'] and prev['sma_fast'] >= prev['sma_slow']
-        
-        # Stochastic conditions
-        stoch_bullish = current['stoch_k'] > current['stoch_d'] and current['stoch_k'] < 80
-        stoch_bearish = current['stoch_k'] < current['stoch_d'] and current['stoch_k'] > 20
-        
-        # Volume and trend strength
-        volume_ok = current['tick_volume'] > current['volume_ema']
-        trend_strength_ok = abs(current['trend_strength']) > 0.5  # Minimum trend strength
-        
-        # Volatility filter
-        volatility_ok = current['volatility_ratio'] < 2.0
-        
-        buy_signal = (
-            sma_crossover and
-            stoch_bullish and
-            current['rsi'] > 40 and current['rsi'] < 70 and
-            volume_ok and
-            trend_strength_ok and
-            volatility_ok
-        )
-        
-        sell_signal = (
-            sma_crossunder and
-            stoch_bearish and
-            current['rsi'] < 60 and current['rsi'] > 30 and
-            volume_ok and
-            trend_strength_ok and
-            volatility_ok
-        )
-        
-        # ETH-specific risk management
-        crypto_params = self.crypto_risk_params['ETHUSDm']
-        base_sl = current['atr'] * crypto_params['volatility_multiplier'] * 100
-        stop_loss_pips = max(crypto_params['min_sl_pips'], 
-                           min(crypto_params['max_sl_pips'], base_sl))
-        
-        take_profit_pips = stop_loss_pips * 2.0  # Even higher reward ratio for ETH
-        
-        signal = 0
-        if buy_signal:
-            signal = 1
-        elif sell_signal:
-            signal = -1
-            
-        return signal, stop_loss_pips, take_profit_pips
-
-    def is_optimal_trading_time(self, symbol):
-        """Check if current time is optimal for trading specific pair"""
-        # Crypto trades 24/7
-        if symbol in ['BTCUSDm', 'ETHUSDm']:
+            logging.info(f"Connected to MT5 Account: {self.account}")
             return True
             
-        current_hour = datetime.now().hour
-        current_weekday = datetime.now().weekday()
-        
-        # Avoid weekends for forex
-        if current_weekday >= 5:
+        except Exception as e:
+            logging.error(f"MT5 connection error: {e}")
             return False
-            
-        # Check pair-specific trading sessions
-        if symbol in self.pair_sessions:
-            for session in self.pair_sessions[symbol]:
-                start, end = self.trading_hours[session]
-                if start <= current_hour < end:
-                    return True
-                    
-        return False
 
-    def execute_trade(self, symbol, signal, stop_loss_pips, take_profit_pips):
-        """Execute trade with proper risk management"""
-        if not self.is_optimal_trading_time(symbol):
-            print(f"Not optimal trading time for {symbol}")
-            return False
+    def shutdown(self):
+        """Shutdown bot gracefully"""
+        logging.info("Shutting down HFT bot...")
+        self.is_running = False
+        self.trading_active = False
+        
+        if self.trading_thread:
+            self.trading_thread.join(timeout=5)
+        if self.monitor_thread:
+            self.monitor_thread.join(timeout=5)
             
-        # Check if position already exists
+        mt5.shutdown()
+        logging.info("HFT bot shutdown complete")
+
+    # ==================== PAIR MANAGEMENT ====================
+    def activate_pair(self, pair: TradingPair):
+        """Activate trading for pair"""
+        self.active_pairs[pair] = True
+        logging.info(f"Activated {pair.value}")
+
+    def deactivate_pair(self, pair: TradingPair):
+        """Deactivate trading for pair"""
+        self.active_pairs[pair] = False
+        self._close_pair_positions(pair.value)
+        logging.info(f"Deactivated {pair.value}")
+
+    def _close_pair_positions(self, symbol: str):
+        """Close all positions for symbol"""
         positions = mt5.positions_get(symbol=symbol)
         if positions:
-            print(f"Position already exists for {symbol}")
-            return False
-            
-        # Calculate position size
-        lot_size = self.calculate_position_size(symbol, stop_loss_pips)
-        
-        # Get current price
-        tick = mt5.symbol_info_tick(symbol)
-        if not tick:
-            print(f"No tick data for {symbol}")
-            return False
-            
-        # Calculate stop loss and take profit
-        point = mt5.symbol_info(symbol).point
-        deviation = 20
-        
-        if signal == 1:  # Buy
-            price = tick.ask
-            sl = price - stop_loss_pips * point * 10
-            tp = price + take_profit_pips * point * 10
-            order_type = mt5.ORDER_TYPE_BUY
-        else:  # Sell
-            price = tick.bid
-            sl = price + stop_loss_pips * point * 10
-            tp = price - take_profit_pips * point * 10
-            order_type = mt5.ORDER_TYPE_SELL
-            
-        # Create request
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": lot_size,
-            "type": order_type,
-            "price": price,
-            "sl": sl,
-            "tp": tp,
-            "deviation": deviation,
-            "magic": 12345,
-            "comment": "Python Bot",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-        }
-        
-        # Send order
-        result = mt5.order_send(request)
-        if result.retcode != mt5.TRADE_RETCODE_DONE:
-            print(f"Trade execution failed for {symbol}: {result.retcode}")
-            return False
-            
-        print(f"Trade executed: {symbol} {'BUY' if signal == 1 else 'SELL'} {lot_size} lots, SL: {stop_loss_pips} pips, TP: {take_profit_pips} pips")
-        return True
+            for position in positions:
+                self.close_position(position.ticket)
 
-    def run_bot(self):
-        """Main bot execution loop"""
-        print("Starting Advanced Forex & Crypto Trading Bot...")
-        symbols = list(self.strategies.keys())
-        print(f"Trading pairs: {', '.join(symbols)}")
+    # ==================== MARKET DATA ====================
+    def update_market_data(self):
+        """Update market data for active pairs"""
+        current_time = time.time()
         
-        while True:
-            try:
-                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"\n--- Checking signals at {current_time} ---")
+        for pair in self.active_pairs:
+            if not self.active_pairs[pair]:
+                continue
                 
-                for symbol in symbols:
-                    print(f"Analyzing {symbol}...")
-                    
-                    # Get technical data
-                    df = self.get_technical_indicators(symbol, self.timeframes['primary'])
-                    if df is None:
-                        print(f"No data for {symbol}, skipping...")
-                        continue
-                    
-                    # Get trading signal
-                    signal, stop_loss_pips, take_profit_pips = self.strategies[symbol](df)
-                    
-                    if signal != 0:
-                        print(f"{symbol} Signal: {'BUY' if signal == 1 else 'SELL'} | SL: {stop_loss_pips:.1f} pips | TP: {take_profit_pips:.1f} pips")
-                        self.execute_trade(symbol, signal, stop_loss_pips, take_profit_pips)
-                    else:
-                        print(f"{symbol}: No clear signal")
+            symbol = pair.value
+            
+            # Throttle updates
+            if symbol in self.last_update and current_time - self.last_update[symbol] < 0.1:
+                continue
                 
-                # Wait before next iteration
-                print("Waiting 60 seconds for next analysis...")
-                time.sleep(60)
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                continue
                 
-            except Exception as e:
-                print(f"Error in main loop: {e}")
-                time.sleep(60)
+            # Initialize data structures
+            if symbol not in self.price_data:
+                self.price_data[symbol] = []
+                self.volume_data[symbol] = []
+                
+            # Add new data
+            self.price_data[symbol].append(tick.bid)
+            self.volume_data[symbol].append(tick.volume)
+            
+            # Maintain data length
+            if len(self.price_data[symbol]) > self.config.data_points:
+                self.price_data[symbol] = self.price_data[symbol][-self.config.data_points:]
+            if len(self.volume_data[symbol]) > self.config.data_points:
+                self.volume_data[symbol] = self.volume_data[symbol][-self.config.data_points:]
+                
+            self.last_update[symbol] = current_time
+
+    def get_current_price(self, symbol: str) -> Optional[float]:
+        """Get current bid price"""
+        tick = mt5.symbol_info_tick(symbol)
+        return tick.bid if tick else None
+
+    # ==================== INDICATORS ====================
+    def calculate_momentum(self, symbol: str) -> float:
+        """Calculate momentum indicator"""
+        prices = self.price_data.get(symbol, [])
+        if len(prices) < self.config.momentum_period:
+            return 0.0
+            
+        recent = prices[-self.config.momentum_period:]
+        return (recent[-1] - recent[0]) / recent[0]
+
+    def calculate_volatility(self, symbol: str) -> float:
+        """Calculate price volatility"""
+        prices = self.price_data.get(symbol, [])
+        if len(prices) < self.config.volatility_period:
+            return 0.0
+            
+        returns = np.diff(prices[-self.config.volatility_period:]) / prices[-self.config.volatility_period:-1]
+        return np.std(returns)
+
+    def calculate_rsi(self, symbol: str) -> float:
+        """Calculate RSI indicator"""
+        prices = self.price_data.get(symbol, [])
+        if len(prices) < self.config.rsi_period + 1:
+            return 50.0
+            
+        deltas = np.diff(prices[-self.config.rsi_period-1:])
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        
+        avg_gain = np.mean(gains)
+        avg_loss = np.mean(losses)
+        
+        if avg_loss == 0:
+            return 100.0
+            
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+
+    # ==================== SIGNAL GENERATION ====================
+    def generate_signal(self, pair: TradingPair) -> Optional[TradeSignal]:
+        """Generate trading signal"""
+        symbol = pair.value
+        
+        # Check data availability
+        if symbol not in self.price_data or len(self.price_data[symbol]) < 20:
+            return None
+            
+        # Calculate indicators
+        momentum = self.calculate_momentum(symbol)
+        volatility = self.calculate_volatility(symbol)
+        rsi = self.calculate_rsi(symbol)
+        
+        # Adaptive threshold based on volatility
+        threshold = 0.0008 + (volatility * 0.3)
+        
+        # Check volatility boundaries
+        if volatility < self.config.min_volatility or volatility > self.config.max_volatility:
+            return None
+            
+        # Generate signals
+        if momentum > threshold and rsi < 65:  # Buy signal
+            volume = self.calculate_position_size(symbol)
+            current_price = self.get_current_price(symbol)
+            
+            if current_price:
+                return TradeSignal(
+                    pair=pair,
+                    side=OrderSide.BUY,
+                    entry_price=current_price,
+                    timestamp=time.time(),
+                    signal_strength=momentum,
+                    volume=volume
+                )
+                
+        elif momentum < -threshold and rsi > 35:  # Sell signal
+            volume = self.calculate_position_size(symbol)
+            current_price = self.get_current_price(symbol)
+            
+            if current_price:
+                return TradeSignal(
+                    pair=pair,
+                    side=OrderSide.SELL,
+                    entry_price=current_price,
+                    timestamp=time.time(),
+                    signal_strength=abs(momentum),
+                    volume=volume
+                )
+                
+        return None
+
+    # ==================== POSITION MANAGEMENT ====================
+    def calculate_position_size(self, symbol: str) -> float:
+        """Calculate position size based on risk management"""
+        account_info = mt5.account_info()
+        if not account_info:
+            return self.config.max_position_size
+            
+        balance = account_info.balance
+        risk_amount = balance * self.config.risk_per_trade
+        
+        # Get symbol info for point value
+        symbol_info = mt5.symbol_info(symbol)
+        if not symbol_info:
+            return self.config.max_position_size
+            
+        # Calculate position size based on stop loss
+        point_value = symbol_info.trade_tick_value
+        if point_value > 0:
+            position_size = risk_amount / (self.config.stop_loss * point_value * 100)
+        else:
+            position_size = self.config.max_position_size
+            
+        return min(position_size, self.config.max_position_size)
+
+    def get_open_positions(self, symbol: str = None) -> List[PositionData]:
+        """Get all open positions"""
+        positions = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
+        if not positions:
+            return []
+            
+        result = []
+        for position in positions:
+            current_price = self.get_current_price(position.symbol)
+            result.append(PositionData(
+                ticket=position.ticket,
+                symbol=position.symbol,
+                type=position.type,
+                volume=position.volume,
+                entry_price=position.price_open,
+                current_price=current_price or position.price_open,
+                profit=position.profit,
+                open_time=position.time
+            ))
+            
+        return result
+
+    def has_open_position(self, symbol: str) -> bool:
+        """Check if symbol has open position"""
+        positions = self.get_open_positions(symbol)
+        return len(positions) > 0
+
+    def execute_trade(self, signal: TradeSignal) -> bool:
+        """Execute trade order"""
+        try:
+            symbol = signal.pair.value
+            order_type = signal.side.value
+            volume = signal.volume
+            
+            # Get current price
+            if signal.side == OrderSide.BUY:
+                price = mt5.symbol_info_tick(symbol).ask
+                tp_price = price * (1 + self.config.profit_target)
+                sl_price = price * (1 - self.config.stop_loss)
+            else:
+                price = mt5.symbol_info_tick(symbol).bid
+                tp_price = price * (1 - self.config.profit_target)
+                sl_price = price * (1 + self.config.stop_loss)
+            
+            # Prepare order request
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": volume,
+                "type": order_type,
+                "price": price,
+                "sl": sl_price,
+                "tp": tp_price,
+                "deviation": 20,
+                "magic": 2024001,
+                "comment": "HFT_BOT",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            
+            # Send order
+            result = mt5.order_send(request)
+            
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                logging.info(f"EXECUTED {signal.side.name} {symbol} | "
+                           f"Price: {price:.2f} | Volume: {volume:.4f} | "
+                           f"Ticket: {result.order}")
+                self.daily_trades += 1
+                self.total_trades += 1
+                return True
+            else:
+                logging.error(f"Order failed: {result.retcode} - {result.comment}")
+                return False
+                
+        except Exception as e:
+            logging.error(f"Trade execution error: {e}")
+            return False
+
+    def close_position(self, ticket: int) -> bool:
+        """Close specific position"""
+        try:
+            position = mt5.positions_get(ticket=ticket)
+            if not position:
+                return False
+                
+            position = position[0]
+            symbol = position.symbol
+            volume = position.volume
+            
+            # Determine close type
+            if position.type == mt5.ORDER_TYPE_BUY:
+                close_type = mt5.ORDER_TYPE_SELL
+                price = mt5.symbol_info_tick(symbol).bid
+            else:
+                close_type = mt5.ORDER_TYPE_BUY
+                price = mt5.symbol_info_tick(symbol).ask
+            
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": symbol,
+                "volume": volume,
+                "type": close_type,
+                "position": ticket,
+                "price": price,
+                "deviation": 20,
+                "magic": 2024001,
+                "comment": "HFT_CLOSE",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            
+            result = mt5.order_send(request)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                logging.info(f"CLOSED position {ticket} for {symbol}")
+                return True
+            else:
+                logging.error(f"Close position failed: {result.retcode}")
+                return False
+                
+        except Exception as e:
+            logging.error(f"Close position error: {e}")
+            return False
 
     def close_all_positions(self):
         """Close all open positions"""
-        positions = mt5.positions_get()
-        if positions:
-            print(f"Closing {len(positions)} positions...")
-            for position in positions:
-                close_request = {
-                    "action": mt5.TRADE_ACTION_DEAL,
-                    "position": position.ticket,
-                    "symbol": position.symbol,
-                    "volume": position.volume,
-                    "type": mt5.ORDER_TYPE_BUY if position.type == 1 else mt5.ORDER_TYPE_SELL,
-                    "price": mt5.symbol_info_tick(position.symbol).bid if position.type == 1 else mt5.symbol_info_tick(position.symbol).ask,
-                    "deviation": 20,
-                    "magic": 12345,
-                    "comment": "Close All",
-                    "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": mt5.ORDER_FILLING_IOC,
-                }
-                result = mt5.order_send(close_request)
-                if result.retcode == mt5.TRADE_RETCODE_DONE:
-                    print(f"Closed position: {position.symbol}")
-                else:
-                    print(f"Failed to close position: {result.retcode}")
-        else:
-            print("No positions to close")
+        positions = self.get_open_positions()
+        for position in positions:
+            self.close_position(position.ticket)
 
-    def get_account_info(self):
-        """Get current account information"""
+    # ==================== RISK MANAGEMENT ====================
+    def check_risk_limits(self) -> bool:
+        """Check if trading is within risk limits"""
+        # Reset daily counter if new day
+        current_date = datetime.now().date()
+        if current_date != self.last_reset:
+            self.daily_trades = 0
+            self.last_reset = current_date
+        
+        # Check daily trade limit
+        if self.daily_trades >= self.config.max_daily_trades:
+            if self.trading_active:
+                logging.warning("Daily trade limit reached - pausing trading")
+                self.trading_active = False
+            return False
+            
+        # Check account equity
+        account_info = mt5.account_info()
+        if not account_info:
+            return False
+            
+        equity = account_info.equity
+        balance = account_info.balance
+        
+        # Check equity protection
+        if equity < balance * self.config.equity_protection:
+            logging.error(f"Equity protection triggered: {equity:.2f} < {balance * self.config.equity_protection:.2f}")
+            self.trading_active = False
+            return False
+            
+        # Check drawdown
+        if balance > 0:
+            drawdown = (balance - equity) / balance
+            if drawdown > self.config.max_drawdown:
+                logging.error(f"Max drawdown exceeded: {drawdown:.2%}")
+                self.trading_active = False
+                return False
+                
+        return True
+
+    def get_open_positions_count(self) -> int:
+        """Get count of open positions"""
+        positions = mt5.positions_get()
+        return len(positions) if positions else 0
+
+    # ==================== TRADING ENGINE ====================
+    def trading_loop(self):
+        """Main trading loop"""
+        logging.info("Starting HFT trading engine...")
+        self.is_running = True
+        
+        while self.is_running:
+            try:
+                # Update market data
+                self.update_market_data()
+                
+                # Check risk management
+                risk_ok = self.check_risk_limits()
+                
+                # Generate and execute signals if trading is active
+                if self.trading_active and risk_ok:
+                    current_positions = self.get_open_positions_count()
+                    
+                    for pair in self.active_pairs:
+                        if not self.active_pairs[pair]:
+                            continue
+                            
+                        # Check position limit
+                        if current_positions >= self.config.max_positions:
+                            break
+                            
+                        # Check if pair already has position
+                        if self.has_open_position(pair.value):
+                            continue
+                            
+                        # Generate signal
+                        signal = self.generate_signal(pair)
+                        if signal:
+                            if self.execute_trade(signal):
+                                current_positions += 1
+                                # Small delay between executions
+                                time.sleep(0.01)
+                
+                # Update performance metrics
+                self.update_performance()
+                
+                # Sleep for next iteration
+                time.sleep(self.config.update_interval)
+                
+            except Exception as e:
+                logging.error(f"Trading loop error: {e}")
+                time.sleep(1)
+
+    def update_performance(self):
+        """Update performance metrics"""
+        positions = self.get_open_positions()
+        self.open_profit = sum(position.profit for position in positions)
+        
+        # Update total profit (this would need to track closed trades properly)
         account_info = mt5.account_info()
         if account_info:
-            print(f"Account Balance: ${account_info.balance:.2f}")
-            print(f"Account Equity: ${account_info.equity:.2f}")
-            print(f"Account Margin: ${account_info.margin:.2f}")
-            print(f"Free Margin: ${account_info.margin_free:.2f}")
-        return account_info
+            self.total_profit = account_info.profit
 
-# Configuration and Execution
-if __name__ == "__main__":
-    # Configuration
-    ACCOUNT_SIZE = 10000  # Adjust based on your account size
-    RISK_PER_TRADE = 0.02  # 2% risk per trade
-    
-    # Create and run bot
-    bot = AdvancedForexBot(ACCOUNT_SIZE, RISK_PER_TRADE)
-    
-    try:
-        # Display account info
-        bot.get_account_info()
+    # ==================== CONFIGURATION MANAGEMENT ====================
+    def save_config(self, filename: str = "hft_config.json"):
+        """Save configuration to file"""
+        config_data = {
+            'bot_config': asdict(self.config),
+            'active_pairs': {p.value: active for p, active in self.active_pairs.items()}
+        }
         
-        # Run the bot
-        bot.run_bot()
-    except KeyboardInterrupt:
-        print("\nStopping bot...")
-        bot.close_all_positions()
-        mt5.shutdown()
-    except Exception as e:
-        print(f"Fatal error: {e}")
-        bot.close_all_positions()
-        mt5.shutdown()
+        try:
+            with open(filename, 'w') as f:
+                json.dump(config_data, f, indent=4)
+            logging.info(f"Configuration saved to {filename}")
+        except Exception as e:
+            logging.error(f"Failed to save config: {e}")
+
+    def load_config(self, filename: str = "hft_config.json"):
+        """Load configuration from file"""
+        try:
+            if os.path.exists(filename):
+                with open(filename, 'r') as f:
+                    config_data = json.load(f)
+                
+                # Update bot config
+                if 'bot_config' in config_data:
+                    for key, value in config_data['bot_config'].items():
+                        if hasattr(self.config, key):
+                            setattr(self.config, key, value)
+                
+                # Update active pairs
+                if 'active_pairs' in config_data:
+                    for pair_str, active in config_data['active_pairs'].items():
+                        pair = TradingPair(pair_str)
+                        self.active_pairs[pair] = active
+                
+                logging.info(f"Configuration loaded from {filename}")
+                
+        except Exception as e:
+            logging.error(f"Failed to load config: {e}")
+
+    # ==================== BOT CONTROL ====================
+    def start_trading(self):
+        """Start the trading bot"""
+        if self.trading_thread and self.trading_thread.is_alive():
+            logging.warning("Trading bot is already running")
+            return
+            
+        self.trading_active = True
+        self.trading_thread = threading.Thread(target=self.trading_loop, daemon=True)
+        self.trading_thread.start()
+        logging.info("HFT trading bot started")
+
+    def stop_trading(self):
+        """Stop the trading bot"""
+        self.trading_active = False
+        self.is_running = False
+        logging.info("HFT trading bot stopped")
+
+    def get_status(self) -> Dict:
+        """Get bot status"""
+        account_info = mt5.account_info()
+        positions = self.get_open_positions()
+        
+        return {
+            'trading_active': self.trading_active,
+            'bot_running': self.is_running,
+            'account_equity': account_info.equity if account_info else 0,
+            'account_balance': account_info.balance if account_info else 0,
+            'open_positions': len(positions),
+            'daily_trades': self.daily_trades,
+            'total_trades': self.total_trades,
+            'open_profit': self.open_profit,
+            'total_profit': self.total_profit,
+            'active_pairs': [p.value for p, active in self.active_pairs.items() if active]
+        }
+
+# ==================== CONTROL INTERFACE ====================
+class HFTControlPanel:
+    def __init__(self, bot: MT5HFTBot):
+        self.bot = bot
+        self.running = True
+        
+    def display_menu(self):
+        print("\n" + "="*60)
+        print("           MT5 HFT TRADING BOT CONTROL PANEL")
+        print("="*60)
+        print("1.  Start Trading")
+        print("2.  Stop Trading")
+        print("3.  Bot Status")
+        print("4.  Pair Management")
+        print("5.  Risk Management")
+        print("6.  Close All Positions")
+        print("7.  Save Configuration")
+        print("8.  Update Trading Parameters")
+        print("9.  Exit")
+        print("="*60)
+        
+    def handle_choice(self, choice: str):
+        if choice == "1":
+            self.bot.start_trading()
+            print("Trading started")
+            
+        elif choice == "2":
+            self.bot.stop_trading()
+            print("Trading stopped")
+            
+        elif choice == "3":
+            self.show_status()
+            
+        elif choice == "4":
+            self.manage_pairs()
+            
+        elif choice == "5":
+            self.manage_risk()
+            
+        elif choice == "6":
+            confirm = input("Close ALL positions? (y/n): ").lower()
+            if confirm == 'y':
+                self.bot.close_all_positions()
+                print("All positions closed")
+                
+        elif choice == "7":
+            self.bot.save_config()
+            
+        elif choice == "8":
+            self.update_parameters()
+            
+        elif choice == "9":
+            self.bot.stop_trading()
+            self.bot.shutdown()
+            self.running = False
+            print("Exiting...")
+            
+        else:
+            print("Invalid choice")
+            
+    def show_status(self):
+        status = self.bot.get_status()
+        print("\n" + "-"*40)
+        print("BOT STATUS")
+        print("-"*40)
+        for key, value in status.items():
+            if key == 'active_pairs':
+                print(f"{key}: {', '.join(value)}")
+            elif isinstance(value, float):
+                print(f"{key}: {value:.2f}")
+            else:
+                print(f"{key}: {value}")
+                
+    def manage_pairs(self):
+        print("\nPair Management:")
+        pairs = list(TradingPair)
+        for i, pair in enumerate(pairs, 1):
+            status = "ACTIVE" if self.bot.active_pairs[pair] else "INACTIVE"
+            print(f"{i}. {pair.value} - {status}")
+            
+        choice = input("Select pair to toggle (1-3) or 0 to return: ")
+        if choice in ["1", "2", "3"]:
+            pair = pairs[int(choice) - 1]
+            if self.bot.active_pairs[pair]:
+                self.bot.deactivate_pair(pair)
+            else:
+                self.bot.activate_pair(pair)
+                
+    def manage_risk(self):
+        print("\nCurrent Risk Parameters:")
+        config = self.bot.config
+        print(f"1. Profit Target: {config.profit_target:.4f}")
+        print(f"2. Stop Loss: {config.stop_loss:.4f}")
+        print(f"3. Max Position Size: {config.max_position_size}")
+        print(f"4. Max Daily Trades: {config.max_daily_trades}")
+        print(f"5. Max Drawdown: {config.max_drawdown:.2%}")
+        
+        choice = input("Select parameter to update (1-5) or 0 to return: ")
+        if choice in ["1", "2", "3", "4", "5"]:
+            new_value = input("Enter new value: ")
+            try:
+                if choice in ["1", "2"]:
+                    new_value = float(new_value)
+                elif choice in ["3", "4"]:
+                    new_value = int(new_value)
+                elif choice == "5":
+                    new_value = float(new_value)
+                    
+                param_map = {
+                    "1": "profit_target", "2": "stop_loss", 
+                    "3": "max_position_size", "4": "max_daily_trades",
+                    "5": "max_drawdown"
+                }
+                
+                setattr(config, param_map[choice], new_value)
+                print("Parameter updated")
+                
+            except ValueError:
+                print("Invalid value")
+                
+    def update_parameters(self):
+        print("\nTrading Parameters:")
+        config = self.bot.config
+        print(f"1. Momentum Period: {config.momentum_period}")
+        print(f"2. RSI Period: {config.rsi_period}")
+        print(f"3. Update Interval: {config.update_interval}")
+        
+        choice = input("Select parameter to update (1-3) or 0 to return: ")
+        if choice in ["1", "2", "3"]:
+            new_value = input("Enter new value: ")
+            try:
+                if choice == "3":
+                    new_value = float(new_value)
+                else:
+                    new_value = int(new_value)
+                    
+                param_map = {"1": "momentum_period", "2": "rsi_period", "3": "update_interval"}
+                setattr(config, param_map[choice], new_value)
+                print("Parameter updated")
+                
+            except ValueError:
+                print("Invalid value")
+                
+    def run(self):
+        """Run control panel"""
+        print("HFT Bot Control Panel Started")
+        
+        while self.running:
+            try:
+                self.display_menu()
+                choice = input("Enter your choice (1-9): ").strip()
+                self.handle_choice(choice)
+                time.sleep(1)
+                
+            except KeyboardInterrupt:
+                print("\nShutting down...")
+                self.bot.stop_trading()
+                self.bot.shutdown()
+                break
+            except Exception as e:
+                print(f"Error: {e}")
+
+# ==================== MAIN EXECUTION ====================
+def main():
+    # MT5 Connection Configuration
+    ACCOUNT = 12345678      # Replace with your MT5 account number
+    PASSWORD = "your_password"  # Replace with your MT5 password
+    SERVER = "your_broker_server"  # Replace with your broker server
+    
+    # Initialize bot
+    bot = MT5HFTBot(account=ACCOUNT, password=PASSWORD, server=SERVER)
+    
+    # Start control panel
+    control_panel = HFTControlPanel(bot)
+    control_panel.run()
+
+if __name__ == "__main__":
+    main(
